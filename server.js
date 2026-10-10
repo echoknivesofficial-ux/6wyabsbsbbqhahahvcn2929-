@@ -1,14 +1,13 @@
 const express = require('express');
 const cors = require('cors');
-const path = require('path');
 const crypto = require('crypto');
 const { PrismaClient } = require('@prisma/client');
 
 const prisma = new PrismaClient();
 const app = express();
+
 app.use(cors());
 app.use(express.json());
-app.use(express.static(__dirname));
 
 const PORT = process.env.PORT || 3001;
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -32,11 +31,6 @@ async function getSession(req) {
     if (!session || session.expiresAt < new Date()) return null;
     return session;
 }
-
-/* ═══ HTML ═══ */
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'index.html'));
-});
 
 /* ═══ HEALTH ═══ */
 app.get('/api/health', async (req, res) => {
