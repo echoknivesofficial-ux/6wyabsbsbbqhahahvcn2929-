@@ -9,6 +9,23 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+/* ═══ ROOT ═══ */
+app.get('/', (req, res) => {
+    res.json({
+        name: 'VCN Backend',
+        status: 'online',
+        version: '1.0.0',
+        endpoints: {
+            health: 'GET /api/health',
+            createSession: 'POST /api/auth/session',
+            getMe: 'GET /api/me',
+            listTargets: 'GET /api/targets',
+            createTarget: 'POST /api/targets',
+            deleteTarget: 'DELETE /api/targets/:id'
+        }
+    });
+});
+
 const PORT = process.env.PORT || 3001;
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 
