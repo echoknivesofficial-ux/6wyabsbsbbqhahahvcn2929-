@@ -1,0 +1,55 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id             String   @id @default(cuid())
+  robloxUserId   String   @unique
+  robloxUsername String
+  displayName    String?
+  avatarUrl      String?
+  balance        Int      @default(24580)
+  createdAt      DateTime @default(now())
+
+  sessions Session[]
+  targets  TargetPost[]
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+model TargetPost {
+  id              String   @id @default(cuid())
+  creatorId       String
+  creator         User     @relation(fields: [creatorId], references: [id])
+
+  targetRobloxId  String
+  targetUsername  String
+  targetDisplay   String?
+  targetAvatar    String?
+
+  reason          String
+  killReward      Int      @default(10)
+  ransomBase      Int      @default(1000)
+  ransomPerWeek   Int      @default(100)
+  ransomPaidUntil DateTime @default(now())
+  isCleared       Boolean  @default(false)
+  killCount       Int      @default(0)
+  status          String   @default("active")
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([status])
+}
