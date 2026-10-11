@@ -1,208 +1,254 @@
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const crypto = require('crypto');
-const { PrismaClient } = require('@prisma/client');
+import express from 'express';
+import cors from 'cors';
+import pg from 'pg';
+import crypto from 'node:crypto';
 
-const prisma = new PrismaClient();
+const { Pool } = pg;
 const app = express();
-app.use(cors());
-app.use(express.json());
+const PORT = process.env.PORT || 3000;
 
-/* ═══ ROOT ═══ */
-app.get('/', (req, res) => {
+// ═══ CONFIG ═══
+const ADMIN_USERNAME = 'Jessemi123';   // Only this Roblox username can post/delete targets
+const SESSION_DAYS = 30;
+
+// ═══ DATABASE ═══
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL?.includes('render.com') ? { rejectUnauthorized: false } : false
+});
+
+// ═══ MIGRATIONS (run on boot) ═══
+async function migrate() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS sessions (
+            token       TEXT PRIMARY KEY,
+            username    TEXT NOT NULL,
+            user_id     TEXT,
+            avatar_url  TEXT,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            expires_at  TIMESTAMPTZ NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS targets (
+            id              TEXT PRIMARY KEY,
+            username        TEXT NOT NULL,
+            display_name    TEXT,
+            user_id         TEXT,
+            avatar_url      TEXT,
+            reason          TEXT DEFAULT '',
+            kill_reward     INTEGER NOT NULL DEFAULT 100,
+            ransom_fee      INTEGER NOT NULL DEFAULT 1000,
+            kills_required  INTEGER NOT NULL DEFAULT 5,
+            kills           INTEGER NOT NULL DEFAULT 0,
+            completion      INTEGER NOT NULL DEFAULT 0,
+            eliminated      BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_targets_eliminated ON targets(eliminated);
+    `);
+    console.log('[db] Migrations complete');
+}
+
+// ═══ MIDDLEWARE ═══
+app.use(cors({
+    origin: true,                  // Allow any origin (or set specific ones)
+    credentials: true,
+    methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+app.use(express.json({ limit: '100kb' }));
+
+// Auth middleware
+async function auth(req, res, next) {
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+    if (!token) return res.status(401).json({ error: 'No token provided' });
+
+    try {
+        const { rows } = await pool.query(
+            `SELECT * FROM sessions WHERE token = $1 AND expires_at > NOW()`,
+            [token]
+        );
+        if (!rows[0]) return res.status(401).json({ error: 'Invalid or expired token' });
+        req.session = rows[0];
+        next();
+    } catch (err) {
+        console.error('[auth] DB error:', err);
+        res.status(500).json({ error: 'Auth check failed' });
+    }
+}
+
+// ═══ HEALTH ═══
+app.get('/api/health', (req, res) => {
+    res.json({ ok: true, service: 'VCN Backend', version: '2.0.0', time: new Date().toISOString() });
+});
+
+// ═══ SESSION ═══
+app.post('/api/auth/session', async (req, res) => {
+    const body = req.body || {};
+    // Accept either robloxUsername or username
+    const username = (body.robloxUsername || body.username || '').trim();
+
+    if (!username) {
+        return res.status(400).json({ error: 'robloxUsername or username required' });
+    }
+
+    try {
+        // Generate a secure token
+        const token = crypto.randomBytes(32).toString('hex');
+
+        await pool.query(
+            `INSERT INTO sessions (token, username, user_id, avatar_url, expires_at)
+             VALUES ($1, $2, $3, $4, NOW() + INTERVAL '${SESSION_DAYS} days')`,
+            [token, username, body.userId || body.robloxUserId || null, body.avatarUrl || null]
+        );
+
+        console.log(`[session] Created for ${username}: ${token.slice(0, 12)}...`);
+
+        res.json({
+            token,
+            username,
+            expiresIn: SESSION_DAYS * 24 * 60 * 60,
+            isAdmin: username.toLowerCase() === ADMIN_USERNAME.toLowerCase()
+        });
+    } catch (err) {
+        console.error('[session] Error:', err);
+        res.status(500).json({ error: 'Could not create session' });
+    }
+});
+
+app.get('/api/me', auth, (req, res) => {
     res.json({
-        name: 'VCN Backend',
-        status: 'online',
-        version: '1.0.0',
-        endpoints: {
-            health: 'GET /api/health',
-            createSession: 'POST /api/auth/session',
-            getMe: 'GET /api/me',
-            listTargets: 'GET /api/targets',
-            createTarget: 'POST /api/targets',
-            deleteTarget: 'DELETE /api/targets/:id'
-        }
+        username: req.session.username,
+        userId: req.session.user_id,
+        isAdmin: req.session.username.toLowerCase() === ADMIN_USERNAME.toLowerCase()
     });
 });
 
-/* ═══ AUTH ═══ */
-async function requireAuth(req, res, next) {
-    try {
-        const token = (req.headers['authorization'] || '').replace('Bearer ', '') || req.body?.sessionToken;
-        if (!token) return res.status(401).json({ error: 'Not authenticated' });
-        const session = await prisma.session.findUnique({ where: { token }, include: { user: true } });
-        if (!session || session.expiresAt < new Date()) return res.status(401).json({ error: 'Session expired' });
-        req.user = session.user;
-        req.session = session;
-        next();
-    } catch (err) {
-        console.error('Auth error:', err);
-        res.status(500).json({ error: 'Auth failed' });
-    }
-}
-
-/* ═══ HEALTH ═══ */
-app.get('/api/health', async (req, res) => {
-    try {
-        await prisma.$queryRaw`SELECT 1`;
-        res.json({ status: 'ok', db: 'connected' });
-    } catch (err) {
-        console.error('Health error:', err.message);
-        res.status(500).json({ status: 'error', db: 'disconnected', message: err.message });
-    }
-});
-
-/* ═══ SESSION ═══ */
-app.post('/api/auth/session', async (req, res) => {
-    try {
-        const { robloxUserId, robloxUsername, displayName, avatarUrl } = req.body;
-        if (!robloxUserId || !robloxUsername) {
-            return res.status(400).json({ error: 'robloxUserId and robloxUsername required' });
-        }
-
-        let user = await prisma.user.findUnique({ where: { robloxUserId } });
-        if (!user) {
-            user = await prisma.user.create({
-                data: {
-                    robloxUserId,
-                    robloxUsername,
-                    displayName: displayName || robloxUsername,
-                    avatarUrl: avatarUrl || null,
-                    balance: 24580
-                }
-            });
-        } else {
-            user = await prisma.user.update({
-                where: { id: user.id },
-                data: {
-                    robloxUsername,
-                    displayName: displayName || robloxUsername,
-                    avatarUrl: avatarUrl || user.avatarUrl
-                }
-            });
-        }
-
-        const token = crypto.randomBytes(32).toString('hex');
-        const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-        await prisma.session.create({ data: { token, userId: user.id, expiresAt } });
-
-        res.json({ token, user });
-    } catch (err) {
-        console.error('Session error:', err);
-        res.status(500).json({ error: 'Session creation failed: ' + err.message });
-    }
-});
-
-app.get('/api/me', requireAuth, (req, res) => res.json({ user: req.user }));
-
-/* ═══ TARGETS ═══ */
-const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
-
-function computeRansomOwed(t) {
-    if (t.isCleared) return 0;
-    const elapsed = Date.now() - new Date(t.ransomPaidUntil).getTime();
-    if (elapsed <= 0) return t.ransomBase;
-    const weeksOverdue = Math.floor(elapsed / WEEK_MS) + 1;
-    return t.ransomBase + (weeksOverdue - 1) * t.ransomPerWeek;
-}
-
+// ═══ TARGETS ═══
 app.get('/api/targets', async (req, res) => {
     try {
-        const posts = await prisma.targetPost.findMany({
-            where: { status: { in: ['active', 'cleared'] } },
-            orderBy: { createdAt: 'desc' },
-            take: 100
-        });
-        const list = posts.map(t => ({
-            ...t,
-            ransomOwed: computeRansomOwed(t),
-            bountyPool: computeRansomOwed(t)
+        const { rows } = await pool.query(
+            `SELECT id, username, display_name, user_id, avatar_url, reason,
+                    kill_reward, ransom_fee, kills_required, kills, completion,
+                    eliminated, created_at
+             FROM targets
+             ORDER BY created_at DESC
+             LIMIT 200`
+        );
+
+        // Map snake_case to camelCase for the frontend
+        const targets = rows.map(t => ({
+            id: t.id,
+            username: t.username,
+            displayName: t.display_name,
+            userId: t.user_id,
+            avatarUrl: t.avatar_url,
+            reason: t.reason,
+            killReward: t.kill_reward,
+            ransomFee: t.ransom_fee,
+            killsRequired: t.kills_required,
+            kills: t.kills,
+            completion: t.completion,
+            eliminated: t.eliminated,
+            createdAt: t.created_at
         }));
-        res.json({ targets: list });
+
+        res.json(targets);
     } catch (err) {
-        console.error('Get targets error:', err);
-        res.status(500).json({ error: 'Database error: ' + err.message });
+        console.error('[targets] GET error:', err);
+        res.status(500).json({ error: 'Could not fetch targets' });
     }
 });
 
-app.post('/api/targets', requireAuth, async (req, res) => {
+app.post('/api/targets', auth, async (req, res) => {
+    // Only admin can post
+    if (req.session.username.toLowerCase() !== ADMIN_USERNAME.toLowerCase()) {
+        return res.status(403).json({ error: `Only ${ADMIN_USERNAME} can post targets` });
+    }
+
+    const b = req.body || {};
+    const username = (b.username || '').trim();
+    if (!username) return res.status(400).json({ error: 'username required' });
+
+    const id = 't-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+    const killReward = Math.max(1, parseInt(b.killReward, 10) || 100);
+    const ransomFee = Math.max(1, parseInt(b.ransomFee, 10) || 1000);
+    const killsRequired = Math.max(1, parseInt(b.killsRequired, 10) || 5);
+    const completion = Math.min(100, Math.max(0, parseInt(b.completion, 10) || 0));
+
     try {
-        const {
-            targetRobloxId, targetUsername, targetDisplay, targetAvatar,
-            reason, killReward
-        } = req.body;
+        const { rows } = await pool.query(
+            `INSERT INTO targets
+                (id, username, display_name, user_id, avatar_url, reason,
+                 kill_reward, ransom_fee, kills_required, kills, completion)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+             RETURNING *`,
+            [
+                id, username,
+                b.displayName || username,
+                b.userId || null,
+                b.avatarUrl || null,
+                b.reason || '',
+                killReward, ransomFee, killsRequired,
+                0, completion
+            ]
+        );
 
-        if (!targetRobloxId || !targetUsername) {
-            return res.status(400).json({ error: 'Target ID and username required' });
-        }
-        if (!reason || reason.trim().length < 10) {
-            return res.status(400).json({ error: 'Reason must be at least 10 characters' });
-        }
-        if (reason.length > 500) {
-            return res.status(400).json({ error: 'Reason too long (max 500)' });
-        }
-        const kr = parseInt(killReward) || 10;
-        if (kr < 1 || kr > 10000) {
-            return res.status(400).json({ error: 'Kill reward 1–10,000 R$' });
-        }
-        if (targetRobloxId === req.user.robloxUserId) {
-            return res.status(400).json({ error: 'You cannot target yourself' });
-        }
+        console.log(`[targets] POST by ${req.session.username}: ${username}`);
 
-        const existing = await prisma.targetPost.findFirst({
-            where: { targetRobloxId, status: 'active' }
+        const t = rows[0];
+        res.status(201).json({
+            id: t.id,
+            username: t.username,
+            displayName: t.display_name,
+            userId: t.user_id,
+            avatarUrl: t.avatar_url,
+            reason: t.reason,
+            killReward: t.kill_reward,
+            ransomFee: t.ransom_fee,
+            killsRequired: t.kills_required,
+            kills: t.kills,
+            completion: t.completion,
+            eliminated: t.eliminated,
+            createdAt: t.created_at
         });
-        if (existing) {
-            return res.status(409).json({ error: 'This user is already on the bounty list' });
-        }
-
-        const post = await prisma.targetPost.create({
-            data: {
-                creatorId: req.user.id,
-                targetRobloxId,
-                targetUsername,
-                targetDisplay: targetDisplay || targetUsername,
-                targetAvatar: targetAvatar || null,
-                reason: reason.trim(),
-                killReward: kr,
-                ransomBase: 1000,
-                ransomPerWeek: 100,
-                ransomPaidUntil: new Date()
-            }
-        });
-        res.json({ target: post });
     } catch (err) {
-        console.error('Create target error:', err);
-        res.status(500).json({ error: 'Failed: ' + err.message });
+        console.error('[targets] POST error:', err);
+        res.status(500).json({ error: 'Could not create target' });
     }
 });
 
-app.delete('/api/targets/:id', requireAuth, async (req, res) => {
+app.delete('/api/targets/:id', auth, async (req, res) => {
+    if (req.session.username.toLowerCase() !== ADMIN_USERNAME.toLowerCase()) {
+        return res.status(403).json({ error: `Only ${ADMIN_USERNAME} can delete targets` });
+    }
+
     try {
-        const post = await prisma.targetPost.findUnique({ where: { id: req.params.id } });
-        if (!post) return res.status(404).json({ error: 'Not found' });
-        if (post.creatorId !== req.user.id) {
-            return res.status(403).json({ error: 'Only the creator can delete' });
-        }
-        await prisma.targetPost.delete({ where: { id: post.id } });
-        res.json({ ok: true });
+        const { rowCount } = await pool.query('DELETE FROM targets WHERE id = $1', [req.params.id]);
+        if (rowCount === 0) return res.status(404).json({ error: 'Target not found' });
+        res.json({ ok: true, deleted: req.params.id });
     } catch (err) {
-        console.error('Delete target error:', err);
-        res.status(500).json({ error: 'Delete failed: ' + err.message });
+        console.error('[targets] DELETE error:', err);
+        res.status(500).json({ error: 'Could not delete target' });
     }
 });
 
-/* ═══ 404 HANDLER ═══ */
-app.use((req, res) => {
-    res.status(404).json({ error: 'Not found', path: req.path });
+// ═══ 404 + ERROR ═══
+app.use((req, res) => res.status(404).json({ error: 'Not found', path: req.path }));
+app.use((err, req, res, next) => {
+    console.error('[error]', err);
+    res.status(500).json({ error: err.message || 'Internal error' });
 });
 
-/* ═══ START ═══ */
-const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
-    console.log(`VCN backend running on port ${PORT}`);
-});
-
-process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err));
-process.on('uncaughtException', (err) => console.error('Uncaught exception:', err));
+// ═══ BOOT ═══
+(async () => {
+    try {
+        await migrate();
+        app.listen(PORT, () => console.log(`[vcn] Listening on :${PORT}`));
+    } catch (err) {
+        console.error('[vcn] Boot failed:', err);
+        process.exit(1);
+    }
+})();
